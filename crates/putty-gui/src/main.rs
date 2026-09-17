@@ -10,6 +10,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Graphics::Dwm::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
 // Menu IDs
 const ID_MENU_NEW_SESSION: usize = 1001;
@@ -24,6 +25,8 @@ const ID_MENU_FIPS_MATRIX: usize = 1012;
 const ID_MENU_KEYGEN: usize = 1020;
 const ID_MENU_TERMINAL: usize = 1021;
 const ID_MENU_VERIFY_SSH: usize = 1022;
+const ID_MENU_CREATE_PR: usize = 1023;
+const ID_MENU_VIEW_REPO: usize = 1024;
 
 const ID_MENU_PROTO_SSH: usize = 1030;
 const ID_MENU_PROTO_TELNET: usize = 1031;
@@ -2204,6 +2207,367 @@ fn handle_launch_external(state: &mut GuiState) {
 
 
 // -------------------------------------------------------------
+
+// -------------------------------------------------------------
+// GitHub Pull Request Dialog & Integration
+// -------------------------------------------------------------
+fn open_browser_url(url: &str) {
+    let wide_url = to_wide(url);
+    let wide_op = to_wide("open");
+    unsafe {
+        ShellExecuteW(
+            0 as _,
+            wide_op.as_ptr(),
+            wide_url.as_ptr(),
+            null_mut(),
+            null_mut(),
+            1, // SW_SHOWNORMAL
+        );
+    }
+}
+
+fn get_current_git_branch() -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !b.is_empty() {
+                return b;
+            }
+        }
+    }
+    "main".to_string()
+}
+
+fn submit_github_pr(base: &str, head: &str, title: &str, body: &str) -> Result<String, String> {
+    if head == base {
+        return Err("GitHub requires that the head branch be different from the base branch (main).\r\nPlease commit your changes to a feature branch before opening a Pull Request.".into());
+    }
+
+    let script = format!(
+        "$cred = @\"\nprotocol=https\nhost=github.com\n\"@ | git credential fill\n\
+        $token = ($cred | Where-Object {{ $_ -like 'password=*' }}).Substring(9)\n\
+        if (-not $token) {{\n    Write-Error 'No GitHub authentication token found in Git Credential Manager.'\n    exit 1\n}}\n\
+        $headers = @{{\n    'Authorization' = \"Bearer $token\"\n    'User-Agent' = 'PuTTY-GUI-Client'\n    'Accept' = 'application/vnd.github.v3+json'\n}}\n\
+        $payload = @{{\n    title = '{}'\n    body = '{}'\n    head = '{}'\n    base = '{}'\n}} | ConvertTo-Json\n\
+        try {{\n    $resp = Invoke-RestMethod -Uri 'https://api.github.com/repos/ssilkdev/putty-rs/pulls' -Method Post -Headers $headers -Body $payload\n    Write-Output \"PR_URL:$($resp.html_url)\"\n}} catch {{\n    $err = $_.ErrorDetails.Message\n    if (-not $err) {{ $err = $_.Exception.Message }}\n    Write-Error $err\n    exit 1\n}}",
+        title.replace("'", "''"),
+        body.replace("'", "''").replace("\r\n", "`n"),
+        head.replace("'", "''"),
+        base.replace("'", "''")
+    );
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .output()
+        .map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(url) = line.strip_prefix("PR_URL:") {
+                return Ok(url.trim().to_string());
+            }
+        }
+        Ok("https://github.com/ssilkdev/putty-rs/pulls".into())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(if stderr.trim().is_empty() { "Unknown error creating Pull Request via GitHub API".into() } else { stderr.trim().to_string() })
+    }
+}
+
+static mut PR_CTX: Option<PrContext> = None;
+
+struct PrContext {
+    current_branch: String,
+    h_font: HFONT,
+    h_title_font: HFONT,
+    h_btn_font: HFONT,
+}
+
+const ID_PRD_EDIT_BASE: usize = 1301;
+const ID_PRD_EDIT_HEAD: usize = 1302;
+const ID_PRD_EDIT_TITLE: usize = 1303;
+const ID_PRD_EDIT_BODY: usize = 1304;
+const ID_PRD_BTN_SUBMIT: usize = 1305;
+const ID_PRD_BTN_WEB: usize = 1306;
+const ID_PRD_BTN_CLOSE: usize = 1307;
+
+unsafe extern "system" fn pr_dlg_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            let dark_mode: i32 = 1;
+            DwmSetWindowAttribute(hwnd, 20, &dark_mode as *const _ as _, std::mem::size_of::<i32>() as u32);
+
+            if let Some(ref ctx) = PR_CTX {
+                let f = ctx.h_font;
+                let fb = ctx.h_btn_font;
+
+                // Base Branch
+                let h_base = CreateWindowExW(
+                    0, to_wide("EDIT").as_ptr(), to_wide("main").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
+                    24, 76, 230, 26, hwnd, ID_PRD_EDIT_BASE as _, 0 as _, null_mut(),
+                );
+                SendMessageW(h_base, WM_SETFONT, f as _, 1);
+
+                // Head Branch
+                let h_head = CreateWindowExW(
+                    0, to_wide("EDIT").as_ptr(), to_wide(&ctx.current_branch).as_ptr(),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
+                    270, 76, 240, 26, hwnd, ID_PRD_EDIT_HEAD as _, 0 as _, null_mut(),
+                );
+                SendMessageW(h_head, WM_SETFONT, f as _, 1);
+
+                // Title
+                let h_title = CreateWindowExW(
+                    0, to_wide("EDIT").as_ptr(), to_wide("feat: ").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
+                    24, 130, 486, 26, hwnd, ID_PRD_EDIT_TITLE as _, 0 as _, null_mut(),
+                );
+                SendMessageW(h_title, WM_SETFONT, f as _, 1);
+
+                // Body
+                let initial_body = "## Summary of Changes\r\n- Describe changes here\r\n\r\n## Verification\r\n- cargo test --workspace (all passed)\r\n- Manual GUI smoke test passed";
+                let h_body = CreateWindowExW(
+                    0, to_wide("EDIT").as_ptr(), to_wide(initial_body).as_ptr(),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | WS_VSCROLL | WS_TABSTOP,
+                    24, 184, 486, 206, hwnd, ID_PRD_EDIT_BODY as _, 0 as _, null_mut(),
+                );
+                SendMessageW(h_body, WM_SETFONT, f as _, 1);
+
+                // Buttons
+                let b_submit = CreateWindowExW(
+                    0, to_wide("BUTTON").as_ptr(), to_wide("Submit PR (API)").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    24, 404, 160, 36, hwnd, ID_PRD_BTN_SUBMIT as _, 0 as _, null_mut(),
+                );
+                SendMessageW(b_submit, WM_SETFONT, fb as _, 1);
+
+                let b_web = CreateWindowExW(
+                    0, to_wide("BUTTON").as_ptr(), to_wide("Open in GitHub Web").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    194, 404, 186, 36, hwnd, ID_PRD_BTN_WEB as _, 0 as _, null_mut(),
+                );
+                SendMessageW(b_web, WM_SETFONT, fb as _, 1);
+
+                let b_close = CreateWindowExW(
+                    0, to_wide("BUTTON").as_ptr(), to_wide("Close").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    400, 404, 110, 36, hwnd, ID_PRD_BTN_CLOSE as _, 0 as _, null_mut(),
+                );
+                SendMessageW(b_close, WM_SETFONT, fb as _, 1);
+
+                SetFocus(h_title);
+            }
+            0
+        }
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+
+            let brush = CreateSolidBrush(0x00202020);
+            FillRect(hdc, &rc, brush);
+            DeleteObject(brush as _);
+
+            SetBkMode(hdc, TRANSPARENT as _);
+            if let Some(ref ctx) = PR_CTX {
+                SelectObject(hdc, ctx.h_title_font as _);
+                SetTextColor(hdc, 0x00C3B700); // cyan
+                let title_w = to_wide("Open GitHub Pull Request");
+                let mut title_rc = RECT { left: 24, top: 12, right: 500, bottom: 34 };
+                DrawTextW(hdc, title_w.as_ptr(), (title_w.len() - 1) as _, &mut title_rc, DT_LEFT | DT_SINGLELINE);
+
+                SelectObject(hdc, ctx.h_font as _);
+                SetTextColor(hdc, 0x00888888);
+                let repo_w = to_wide("Target Repository: https://github.com/ssilkdev/putty-rs");
+                let mut repo_rc = RECT { left: 24, top: 34, right: 500, bottom: 52 };
+                DrawTextW(hdc, repo_w.as_ptr(), (repo_w.len() - 1) as _, &mut repo_rc, DT_LEFT | DT_SINGLELINE);
+
+                SetTextColor(hdc, 0x00A0A0A0);
+                let labels = [
+                    ("Base Branch:", 24, 56),
+                    ("Head Branch (Your Branch):", 270, 56),
+                    ("Pull Request Title:", 24, 110),
+                    ("Description / Changelog (Markdown):", 24, 164),
+                ];
+                for (txt, x, y) in labels {
+                    let w = to_wide(txt);
+                    let mut text_rc = RECT { left: x, top: y, right: x + 300, bottom: y + 18 };
+                    DrawTextW(hdc, w.as_ptr(), (w.len() - 1) as _, &mut text_rc, DT_LEFT | DT_SINGLELINE);
+                }
+            }
+
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_CTLCOLOREDIT => {
+            let hdc = wparam as HDC;
+            SetTextColor(hdc, 0x00EDEDED);
+            SetBkColor(hdc, 0x002A2A2A);
+            if let Some(ref st) = APP_STATE {
+                st.h_input_brush as _
+            } else {
+                GetStockObject(BLACK_BRUSH as _) as _
+            }
+        }
+        WM_DRAWITEM => {
+            let dis = *(lparam as *const DRAWITEMSTRUCT);
+            let font = if let Some(ref ctx) = PR_CTX { ctx.h_btn_font } else { 0 as _ };
+            match dis.CtlID as usize {
+                ID_PRD_BTN_SUBMIT => draw_modern_button(&dis, true, "Submit PR (API)", font),
+                ID_PRD_BTN_WEB => draw_modern_button(&dis, false, "Open in GitHub Web", font),
+                ID_PRD_BTN_CLOSE => draw_modern_button(&dis, false, "Close", font),
+                _ => {}
+            }
+            1
+        }
+        WM_COMMAND => {
+            let id = (wparam & 0xFFFF) as usize;
+            match id {
+                ID_PRD_BTN_SUBMIT => {
+                    let base = get_text(GetDlgItem(hwnd, ID_PRD_EDIT_BASE as i32)).trim().to_string();
+                    let head = get_text(GetDlgItem(hwnd, ID_PRD_EDIT_HEAD as i32)).trim().to_string();
+                    let title = get_text(GetDlgItem(hwnd, ID_PRD_EDIT_TITLE as i32)).trim().to_string();
+                    let body = get_text(GetDlgItem(hwnd, ID_PRD_EDIT_BODY as i32));
+
+                    if title.is_empty() || title == "feat:" {
+                        show_dark_alert(hwnd, "Validation Error", "Please provide a descriptive Pull Request title.", PopupKind::Warning);
+                        return 0;
+                    }
+
+                    match submit_github_pr(&base, &head, &title, &body) {
+                        Ok(pr_url) => {
+                            let _ = copy_to_clipboard(hwnd, &pr_url);
+                            show_dark_alert(
+                                hwnd,
+                                "Pull Request Created",
+                                &format!("Pull Request created successfully on GitHub!\r\n\r\nURL: {}\r\n(Copied to clipboard and opened in browser)", pr_url),
+                                PopupKind::Success,
+                            );
+                            open_browser_url(&pr_url);
+                            DestroyWindow(hwnd);
+                        }
+                        Err(err) => {
+                            let should_open_web = show_dark_confirm(
+                                hwnd,
+                                "GitHub API Notice",
+                                &format!("Could not create PR directly via API:\r\n{}\r\n\r\nWould you like to open the GitHub Compare & PR page in your web browser instead?", err),
+                            );
+                            if should_open_web {
+                                let web_url = if head != base && !head.is_empty() {
+                                    format!("https://github.com/ssilkdev/putty-rs/compare/{}...{}?expand=1", base, head)
+                                } else {
+                                    "https://github.com/ssilkdev/putty-rs/compare".to_string()
+                                };
+                                open_browser_url(&web_url);
+                                DestroyWindow(hwnd);
+                            }
+                        }
+                    }
+                }
+                ID_PRD_BTN_WEB => {
+                    let base = get_text(GetDlgItem(hwnd, ID_PRD_EDIT_BASE as i32)).trim().to_string();
+                    let head = get_text(GetDlgItem(hwnd, ID_PRD_EDIT_HEAD as i32)).trim().to_string();
+                    let web_url = if head != base && !head.is_empty() {
+                        format!("https://github.com/ssilkdev/putty-rs/compare/{}...{}?expand=1", base, head)
+                    } else {
+                        "https://github.com/ssilkdev/putty-rs/compare".to_string()
+                    };
+                    open_browser_url(&web_url);
+                    DestroyWindow(hwnd);
+                }
+                ID_PRD_BTN_CLOSE => {
+                    DestroyWindow(hwnd);
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn show_pr_dialog(parent: HWND) {
+    unsafe {
+        let (h_font, h_title_font, h_btn_font) = if let Some(ref st) = APP_STATE {
+            (st.h_font, st.h_title_font, st.h_btn_font)
+        } else {
+            (0 as _, 0 as _, 0 as _)
+        };
+
+        let current_branch = get_current_git_branch();
+
+        PR_CTX = Some(PrContext {
+            current_branch,
+            h_font,
+            h_title_font,
+            h_btn_font,
+        });
+
+        let class_name = to_wide("PuttyPrDlgClass");
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(pr_dlg_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: 0 as _,
+            hIcon: LoadIconW(0 as _, IDI_APPLICATION),
+            hCursor: LoadCursorW(0 as _, IDC_ARROW),
+            hbrBackground: 0 as _,
+            lpszMenuName: null_mut(),
+            lpszClassName: class_name.as_ptr(),
+        };
+        RegisterClassW(&wc);
+
+        let mut parent_rc: RECT = std::mem::zeroed();
+        GetWindowRect(parent, &mut parent_rc);
+        let w = 550;
+        let h = 490;
+        let x = parent_rc.left + ((parent_rc.right - parent_rc.left) - w) / 2;
+        let y = parent_rc.top + ((parent_rc.bottom - parent_rc.top) - h) / 2;
+
+        let wnd_title = to_wide("Create GitHub Pull Request - ssilkdev/putty-rs");
+        let dlg = CreateWindowExW(
+            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+            class_name.as_ptr(),
+            wnd_title.as_ptr(),
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            x, y, w, h,
+            parent, 0 as _, 0 as _, null_mut(),
+        );
+
+        EnableWindow(parent, 0);
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, 0 as _, 0, 0) > 0 {
+            if msg.message == WM_KEYDOWN && msg.wParam == 27 {
+                DestroyWindow(dlg);
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if !IsWindow(dlg) != 0 {
+                break;
+            }
+        }
+        EnableWindow(parent, 1);
+        SetFocus(parent);
+    }
+}
+
 // Main Window Procedure & Initialization
 // -------------------------------------------------------------
 unsafe extern "system" fn main_wnd_proc(
@@ -2249,6 +2613,7 @@ unsafe extern "system" fn main_wnd_proc(
             AppendMenuW(h_tools_menu, MF_STRING, ID_MENU_KEYGEN, to_wide("PuTTYgen Key Generator...").as_ptr());
             AppendMenuW(h_tools_menu, MF_STRING, ID_MENU_TERMINAL, to_wide("Interactive Terminal Console...").as_ptr());
             AppendMenuW(h_tools_menu, MF_SEPARATOR, 0, null_mut());
+            AppendMenuW(h_tools_menu, MF_STRING, ID_MENU_CREATE_PR, to_wide("Create GitHub Pull Request...").as_ptr());
             AppendMenuW(h_tools_menu, MF_STRING, ID_MENU_VERIFY_SSH, to_wide("Verify SSH Host Connection...").as_ptr());
             AppendMenuW(h_menu, MF_POPUP, h_tools_menu as usize, to_wide("&Tools").as_ptr());
 
@@ -2261,6 +2626,8 @@ unsafe extern "system" fn main_wnd_proc(
 
             // Help Menu
             let h_help_menu = CreatePopupMenu();
+            AppendMenuW(h_help_menu, MF_STRING, ID_MENU_VIEW_REPO, to_wide("View GitHub Repository (putty-rs)...").as_ptr());
+            AppendMenuW(h_help_menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(h_help_menu, MF_STRING, ID_MENU_ABOUT, to_wide("About PuTTY FIPS 140-3...").as_ptr());
             AppendMenuW(h_menu, MF_POPUP, h_help_menu as usize, to_wide("&Help").as_ptr());
 
@@ -2564,6 +2931,12 @@ unsafe extern "system" fn main_wnd_proc(
                 }
                 ID_MENU_KEYGEN => {
                     show_keygen_dialog(state.hwnd);
+                }
+                ID_MENU_CREATE_PR => {
+                    show_pr_dialog(state.hwnd);
+                }
+                ID_MENU_VIEW_REPO => {
+                    open_browser_url("https://github.com/ssilkdev/putty-rs");
                 }
                 ID_MENU_TERMINAL => {
                     show_terminal_dialog(state.hwnd);

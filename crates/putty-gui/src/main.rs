@@ -27,6 +27,7 @@ const ID_MENU_TERMINAL: usize = 1021;
 const ID_MENU_VERIFY_SSH: usize = 1022;
 const ID_MENU_CREATE_PR: usize = 1023;
 const ID_MENU_VIEW_REPO: usize = 1024;
+const ID_MENU_SUBMIT_ISSUE: usize = 1025;
 
 const ID_MENU_PROTO_SSH: usize = 1030;
 const ID_MENU_PROTO_TELNET: usize = 1031;
@@ -2278,6 +2279,363 @@ fn submit_github_pr(base: &str, head: &str, title: &str, body: &str) -> Result<S
     }
 }
 
+
+// -------------------------------------------------------------
+// GitHub Issue Dialog & Integration
+// -------------------------------------------------------------
+fn submit_github_issue(title: &str, body: &str, label: &str) -> Result<String, String> {
+    let script = format!(
+        "$cred = @\"\nprotocol=https\nhost=github.com\n\"@ | git credential fill\n\
+        $token = ($cred | Where-Object {{ $_ -like 'password=*' }}).Substring(9)\n\
+        if (-not $token) {{\n    Write-Error 'No GitHub authentication token found in Git Credential Manager.'\n    exit 1\n}}\n\
+        $headers = @{{\n    'Authorization' = \"Bearer $token\"\n    'User-Agent' = 'PuTTY-GUI-Client'\n    'Accept' = 'application/vnd.github.v3+json'\n}}\n\
+        $labels = @('{}')\n\
+        $payload = @{{\n    title = '{}'\n    body = '{}'\n    labels = $labels\n}} | ConvertTo-Json\n\
+        try {{\n    $resp = Invoke-RestMethod -Uri 'https://api.github.com/repos/ssilkdev/putty-rs/issues' -Method Post -Headers $headers -Body $payload\n    Write-Output \"ISSUE_URL:$($resp.html_url)\"\n}} catch {{\n    $err = $_.ErrorDetails.Message\n    if (-not $err) {{ $err = $_.Exception.Message }}\n    Write-Error $err\n    exit 1\n}}",
+        label.replace("'", "''"),
+        title.replace("'", "''"),
+        body.replace("'", "''").replace("\r\n", "`n")
+    );
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .output()
+        .map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(url) = line.strip_prefix("ISSUE_URL:") {
+                return Ok(url.trim().to_string());
+            }
+        }
+        Ok("https://github.com/ssilkdev/putty-rs/issues".into())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(if stderr.trim().is_empty() { "Unknown error creating Issue via GitHub API".into() } else { stderr.trim().to_string() })
+    }
+}
+
+static mut ISSUE_CTX: Option<IssueContext> = None;
+
+struct IssueContext {
+    issue_type: usize, // 1: Bug, 2: Feature, 3: Security
+    h_font: HFONT,
+    h_title_font: HFONT,
+    h_btn_font: HFONT,
+}
+
+const ID_ISD_RADIO_BUG: usize = 1401;
+const ID_ISD_RADIO_FEATURE: usize = 1402;
+const ID_ISD_RADIO_SECURITY: usize = 1403;
+const ID_ISD_EDIT_TITLE: usize = 1404;
+const ID_ISD_EDIT_BODY: usize = 1405;
+const ID_ISD_BTN_SUBMIT: usize = 1406;
+const ID_ISD_BTN_WEB: usize = 1407;
+const ID_ISD_BTN_CLOSE: usize = 1408;
+
+unsafe extern "system" fn issue_dlg_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            let dark_mode: i32 = 1;
+            DwmSetWindowAttribute(hwnd, 20, &dark_mode as *const _ as _, std::mem::size_of::<i32>() as u32);
+
+            if let Some(ref ctx) = ISSUE_CTX {
+                let f = ctx.h_font;
+                let fb = ctx.h_btn_font;
+
+                // Radio Buttons for Issue Type
+                let r_bug = CreateWindowExW(
+                    0, to_wide("BUTTON").as_ptr(), to_wide("Bug Report").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
+                    24, 60, 120, 24, hwnd, ID_ISD_RADIO_BUG as _, 0 as _, null_mut(),
+                );
+                SendMessageW(r_bug, WM_SETFONT, f as _, 1);
+                SendMessageW(r_bug, BM_SETCHECK, 1, 0);
+
+                let r_feature = CreateWindowExW(
+                    0, to_wide("BUTTON").as_ptr(), to_wide("Feature Request").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_TABSTOP,
+                    154, 60, 140, 24, hwnd, ID_ISD_RADIO_FEATURE as _, 0 as _, null_mut(),
+                );
+                SendMessageW(r_feature, WM_SETFONT, f as _, 1);
+
+                let r_security = CreateWindowExW(
+                    0, to_wide("BUTTON").as_ptr(), to_wide("Security / FIPS").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_TABSTOP,
+                    304, 60, 150, 24, hwnd, ID_ISD_RADIO_SECURITY as _, 0 as _, null_mut(),
+                );
+                SendMessageW(r_security, WM_SETFONT, f as _, 1);
+
+                // Title Edit
+                let h_title = CreateWindowExW(
+                    0, to_wide("EDIT").as_ptr(), to_wide("[Bug] ").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
+                    24, 114, 486, 26, hwnd, ID_ISD_EDIT_TITLE as _, 0 as _, null_mut(),
+                );
+                SendMessageW(h_title, WM_SETFONT, f as _, 1);
+
+                // Body Edit
+                let initial_body = "### Description\r\n\r\n### Steps to Reproduce\r\n1. \r\n2. \r\n\r\n### Expected Behavior\r\n\r\n### Environment\r\n- OS: Windows 11\r\n- Security Mode: FIPS 140-3 ENFORCED\r\n- Version: PuTTY Rust v0.85";
+                let h_body = CreateWindowExW(
+                    0, to_wide("EDIT").as_ptr(), to_wide(initial_body).as_ptr(),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | WS_VSCROLL | WS_TABSTOP,
+                    24, 168, 486, 222, hwnd, ID_ISD_EDIT_BODY as _, 0 as _, null_mut(),
+                );
+                SendMessageW(h_body, WM_SETFONT, f as _, 1);
+
+                // Buttons
+                let b_submit = CreateWindowExW(
+                    0, to_wide("BUTTON").as_ptr(), to_wide("Submit Issue (API)").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    24, 404, 160, 36, hwnd, ID_ISD_BTN_SUBMIT as _, 0 as _, null_mut(),
+                );
+                SendMessageW(b_submit, WM_SETFONT, fb as _, 1);
+
+                let b_web = CreateWindowExW(
+                    0, to_wide("BUTTON").as_ptr(), to_wide("Open in GitHub Web").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    194, 404, 186, 36, hwnd, ID_ISD_BTN_WEB as _, 0 as _, null_mut(),
+                );
+                SendMessageW(b_web, WM_SETFONT, fb as _, 1);
+
+                let b_close = CreateWindowExW(
+                    0, to_wide("BUTTON").as_ptr(), to_wide("Close").as_ptr(),
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                    400, 404, 110, 36, hwnd, ID_ISD_BTN_CLOSE as _, 0 as _, null_mut(),
+                );
+                SendMessageW(b_close, WM_SETFONT, fb as _, 1);
+
+                SetFocus(h_title);
+            }
+            0
+        }
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+
+            let brush = CreateSolidBrush(0x00202020);
+            FillRect(hdc, &rc, brush);
+            DeleteObject(brush as _);
+
+            SetBkMode(hdc, TRANSPARENT as _);
+            if let Some(ref ctx) = ISSUE_CTX {
+                SelectObject(hdc, ctx.h_title_font as _);
+                SetTextColor(hdc, 0x00C3B700); // cyan
+                let title_w = to_wide("Submit GitHub Issue");
+                let mut title_rc = RECT { left: 24, top: 12, right: 500, bottom: 34 };
+                DrawTextW(hdc, title_w.as_ptr(), (title_w.len() - 1) as _, &mut title_rc, DT_LEFT | DT_SINGLELINE);
+
+                SelectObject(hdc, ctx.h_font as _);
+                SetTextColor(hdc, 0x00888888);
+                let repo_w = to_wide("Target Repository: https://github.com/ssilkdev/putty-rs");
+                let mut repo_rc = RECT { left: 24, top: 34, right: 500, bottom: 52 };
+                DrawTextW(hdc, repo_w.as_ptr(), (repo_w.len() - 1) as _, &mut repo_rc, DT_LEFT | DT_SINGLELINE);
+
+                SetTextColor(hdc, 0x00A0A0A0);
+                let labels = [
+                    ("Issue Title:", 24, 94),
+                    ("Description / Details (Markdown):", 24, 148),
+                ];
+                for (txt, x, y) in labels {
+                    let w = to_wide(txt);
+                    let mut text_rc = RECT { left: x, top: y, right: x + 300, bottom: y + 18 };
+                    DrawTextW(hdc, w.as_ptr(), (w.len() - 1) as _, &mut text_rc, DT_LEFT | DT_SINGLELINE);
+                }
+            }
+
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_CTLCOLORSTATIC => {
+            let hdc = wparam as HDC;
+            SetTextColor(hdc, 0x00EDEDED);
+            SetBkColor(hdc, 0x00202020);
+            if let Some(ref st) = APP_STATE {
+                st.h_panel_brush as _
+            } else {
+                GetStockObject(BLACK_BRUSH as _) as _
+            }
+        }
+        WM_CTLCOLOREDIT => {
+            let hdc = wparam as HDC;
+            SetTextColor(hdc, 0x00EDEDED);
+            SetBkColor(hdc, 0x002A2A2A);
+            if let Some(ref st) = APP_STATE {
+                st.h_input_brush as _
+            } else {
+                GetStockObject(BLACK_BRUSH as _) as _
+            }
+        }
+        WM_DRAWITEM => {
+            let dis = *(lparam as *const DRAWITEMSTRUCT);
+            let font = if let Some(ref ctx) = ISSUE_CTX { ctx.h_btn_font } else { 0 as _ };
+            match dis.CtlID as usize {
+                ID_ISD_BTN_SUBMIT => draw_modern_button(&dis, true, "Submit Issue (API)", font),
+                ID_ISD_BTN_WEB => draw_modern_button(&dis, false, "Open in GitHub Web", font),
+                ID_ISD_BTN_CLOSE => draw_modern_button(&dis, false, "Close", font),
+                _ => {}
+            }
+            1
+        }
+        WM_COMMAND => {
+            let id = (wparam & 0xFFFF) as usize;
+            match id {
+                ID_ISD_RADIO_BUG => {
+                    if let Some(ref mut ctx) = ISSUE_CTX { ctx.issue_type = 1; }
+                    let h_title = GetDlgItem(hwnd, ID_ISD_EDIT_TITLE as i32);
+                    let curr = get_text(h_title);
+                    if curr.is_empty() || curr == "[Feature] " || curr == "[Security] " {
+                        set_text(h_title, "[Bug] ");
+                    }
+                }
+                ID_ISD_RADIO_FEATURE => {
+                    if let Some(ref mut ctx) = ISSUE_CTX { ctx.issue_type = 2; }
+                    let h_title = GetDlgItem(hwnd, ID_ISD_EDIT_TITLE as i32);
+                    let curr = get_text(h_title);
+                    if curr.is_empty() || curr == "[Bug] " || curr == "[Security] " {
+                        set_text(h_title, "[Feature] ");
+                    }
+                }
+                ID_ISD_RADIO_SECURITY => {
+                    if let Some(ref mut ctx) = ISSUE_CTX { ctx.issue_type = 3; }
+                    let h_title = GetDlgItem(hwnd, ID_ISD_EDIT_TITLE as i32);
+                    let curr = get_text(h_title);
+                    if curr.is_empty() || curr == "[Bug] " || curr == "[Feature] " {
+                        set_text(h_title, "[Security] ");
+                    }
+                }
+                ID_ISD_BTN_SUBMIT => {
+                    let title = get_text(GetDlgItem(hwnd, ID_ISD_EDIT_TITLE as i32)).trim().to_string();
+                    let body = get_text(GetDlgItem(hwnd, ID_ISD_EDIT_BODY as i32));
+                    let itype = ISSUE_CTX.as_ref().map(|c| c.issue_type).unwrap_or(1);
+                    let label = match itype {
+                        2 => "enhancement",
+                        3 => "security",
+                        _ => "bug",
+                    };
+
+                    if title.is_empty() || title == "[Bug] " || title == "[Feature] " || title == "[Security] " {
+                        show_dark_alert(hwnd, "Validation Error", "Please provide a descriptive Issue title.", PopupKind::Warning);
+                        return 0;
+                    }
+
+                    match submit_github_issue(&title, &body, label) {
+                        Ok(issue_url) => {
+                            let _ = copy_to_clipboard(hwnd, &issue_url);
+                            show_dark_alert(
+                                hwnd,
+                                "Issue Created",
+                                &format!("GitHub Issue created successfully!\r\n\r\nURL: {}\r\n(Copied to clipboard and opened in browser)", issue_url),
+                                PopupKind::Success,
+                            );
+                            open_browser_url(&issue_url);
+                            DestroyWindow(hwnd);
+                        }
+                        Err(err) => {
+                            let should_open_web = show_dark_confirm(
+                                hwnd,
+                                "GitHub API Notice",
+                                &format!("Could not create Issue directly via API:\r\n{}\r\n\r\nWould you like to open GitHub Issue creation in your web browser instead?", err),
+                            );
+                            if should_open_web {
+                                open_browser_url("https://github.com/ssilkdev/putty-rs/issues/new");
+                                DestroyWindow(hwnd);
+                            }
+                        }
+                    }
+                }
+                ID_ISD_BTN_WEB => {
+                    open_browser_url("https://github.com/ssilkdev/putty-rs/issues/new");
+                    DestroyWindow(hwnd);
+                }
+                ID_ISD_BTN_CLOSE => {
+                    DestroyWindow(hwnd);
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn show_issue_dialog(parent: HWND) {
+    unsafe {
+        let (h_font, h_title_font, h_btn_font) = if let Some(ref st) = APP_STATE {
+            (st.h_font, st.h_title_font, st.h_btn_font)
+        } else {
+            (0 as _, 0 as _, 0 as _)
+        };
+
+        ISSUE_CTX = Some(IssueContext {
+            issue_type: 1,
+            h_font,
+            h_title_font,
+            h_btn_font,
+        });
+
+        let class_name = to_wide("PuttyIssueDlgClass");
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(issue_dlg_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: 0 as _,
+            hIcon: LoadIconW(0 as _, IDI_APPLICATION),
+            hCursor: LoadCursorW(0 as _, IDC_ARROW),
+            hbrBackground: 0 as _,
+            lpszMenuName: null_mut(),
+            lpszClassName: class_name.as_ptr(),
+        };
+        RegisterClassW(&wc);
+
+        let mut parent_rc: RECT = std::mem::zeroed();
+        GetWindowRect(parent, &mut parent_rc);
+        let w = 550;
+        let h = 490;
+        let x = parent_rc.left + ((parent_rc.right - parent_rc.left) - w) / 2;
+        let y = parent_rc.top + ((parent_rc.bottom - parent_rc.top) - h) / 2;
+
+        let wnd_title = to_wide("Submit GitHub Issue - ssilkdev/putty-rs");
+        let dlg = CreateWindowExW(
+            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+            class_name.as_ptr(),
+            wnd_title.as_ptr(),
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            x, y, w, h,
+            parent, 0 as _, 0 as _, null_mut(),
+        );
+
+        EnableWindow(parent, 0);
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, 0 as _, 0, 0) > 0 {
+            if msg.message == WM_KEYDOWN && msg.wParam == 27 {
+                DestroyWindow(dlg);
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if !IsWindow(dlg) != 0 {
+                break;
+            }
+        }
+        EnableWindow(parent, 1);
+        SetFocus(parent);
+    }
+}
+
 static mut PR_CTX: Option<PrContext> = None;
 
 struct PrContext {
@@ -2614,6 +2972,7 @@ unsafe extern "system" fn main_wnd_proc(
             AppendMenuW(h_tools_menu, MF_STRING, ID_MENU_TERMINAL, to_wide("Interactive Terminal Console...").as_ptr());
             AppendMenuW(h_tools_menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(h_tools_menu, MF_STRING, ID_MENU_CREATE_PR, to_wide("Create GitHub Pull Request...").as_ptr());
+            AppendMenuW(h_tools_menu, MF_STRING, ID_MENU_SUBMIT_ISSUE, to_wide("Submit GitHub Issue / Bug Report...").as_ptr());
             AppendMenuW(h_tools_menu, MF_STRING, ID_MENU_VERIFY_SSH, to_wide("Verify SSH Host Connection...").as_ptr());
             AppendMenuW(h_menu, MF_POPUP, h_tools_menu as usize, to_wide("&Tools").as_ptr());
 
@@ -2627,6 +2986,7 @@ unsafe extern "system" fn main_wnd_proc(
             // Help Menu
             let h_help_menu = CreatePopupMenu();
             AppendMenuW(h_help_menu, MF_STRING, ID_MENU_VIEW_REPO, to_wide("View GitHub Repository (putty-rs)...").as_ptr());
+            AppendMenuW(h_help_menu, MF_STRING, ID_MENU_SUBMIT_ISSUE, to_wide("Submit GitHub Issue / Bug Report...").as_ptr());
             AppendMenuW(h_help_menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(h_help_menu, MF_STRING, ID_MENU_ABOUT, to_wide("About PuTTY FIPS 140-3...").as_ptr());
             AppendMenuW(h_menu, MF_POPUP, h_help_menu as usize, to_wide("&Help").as_ptr());
@@ -2934,6 +3294,9 @@ unsafe extern "system" fn main_wnd_proc(
                 }
                 ID_MENU_CREATE_PR => {
                     show_pr_dialog(state.hwnd);
+                }
+                ID_MENU_SUBMIT_ISSUE => {
+                    show_issue_dialog(state.hwnd);
                 }
                 ID_MENU_VIEW_REPO => {
                     open_browser_url("https://github.com/ssilkdev/putty-rs");

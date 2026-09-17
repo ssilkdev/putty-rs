@@ -2280,6 +2280,43 @@ fn submit_github_pr(base: &str, head: &str, title: &str, body: &str) -> Result<S
 }
 
 
+
+const WM_APP_ISSUE_DONE: u32 = 0x8000 + 10;
+const WM_APP_PR_DONE: u32 = 0x8000 + 11;
+const ID_TIMER_ISSUE_PROGRESS: usize = 991;
+const ID_TIMER_PR_PROGRESS: usize = 992;
+
+static mut ISSUE_RESULT: Option<Result<String, String>> = None;
+static mut PR_RESULT: Option<Result<String, String>> = None;
+
+unsafe fn draw_progress_bar(hdc: HDC, x: i32, y: i32, w: i32, h: i32, percent: u32) {
+    let track_brush = CreateSolidBrush(0x00181818);
+    let border_pen = CreatePen(PS_SOLID as _, 1, 0x003A3A3A);
+    let old_brush = SelectObject(hdc, track_brush as _);
+    let old_pen = SelectObject(hdc, border_pen as _);
+    RoundRect(hdc, x, y, x + w, y + h, 4, 4);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(track_brush as _);
+    DeleteObject(border_pen as _);
+
+    if percent > 0 {
+        let fill_w = (((w - 2) as f32) * (percent.min(100) as f32 / 100.0)) as i32;
+        if fill_w > 2 {
+            let fill_color = if percent >= 100 { 0x0032CD32 } else { 0x00D47800 }; // Green when complete, Accent Blue in progress
+            let fill_brush = CreateSolidBrush(fill_color);
+            let fill_pen = CreatePen(PS_SOLID as _, 1, fill_color);
+            let old_brush = SelectObject(hdc, fill_brush as _);
+            let old_pen = SelectObject(hdc, fill_pen as _);
+            RoundRect(hdc, x + 1, y + 1, x + 1 + fill_w, y + h - 1, 3, 3);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            DeleteObject(fill_brush as _);
+            DeleteObject(fill_pen as _);
+        }
+    }
+}
+
 // -------------------------------------------------------------
 // GitHub Issue Dialog & Integration
 // -------------------------------------------------------------
@@ -2316,10 +2353,14 @@ fn submit_github_issue(title: &str, body: &str, label: &str) -> Result<String, S
     }
 }
 
+
 static mut ISSUE_CTX: Option<IssueContext> = None;
 
 struct IssueContext {
     issue_type: usize, // 1: Bug, 2: Feature, 3: Security
+    progress_percent: u32,
+    status_msg: String,
+    is_submitting: bool,
     h_font: HFONT,
     h_title_font: HFONT,
     h_btn_font: HFONT,
@@ -2333,6 +2374,7 @@ const ID_ISD_EDIT_BODY: usize = 1405;
 const ID_ISD_BTN_SUBMIT: usize = 1406;
 const ID_ISD_BTN_WEB: usize = 1407;
 const ID_ISD_BTN_CLOSE: usize = 1408;
+const ID_ISD_STATIC_STATUS: usize = 1409;
 
 unsafe extern "system" fn issue_dlg_proc(
     hwnd: HWND,
@@ -2385,29 +2427,37 @@ unsafe extern "system" fn issue_dlg_proc(
                 let h_body = CreateWindowExW(
                     0, to_wide("EDIT").as_ptr(), to_wide(initial_body).as_ptr(),
                     WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | WS_VSCROLL | WS_TABSTOP,
-                    24, 168, 486, 222, hwnd, ID_ISD_EDIT_BODY as _, 0 as _, null_mut(),
+                    24, 168, 486, 196, hwnd, ID_ISD_EDIT_BODY as _, 0 as _, null_mut(),
                 );
                 SendMessageW(h_body, WM_SETFONT, f as _, 1);
+
+                // Progress Status Text
+                let h_status = CreateWindowExW(
+                    0, to_wide("STATIC").as_ptr(), to_wide(&ctx.status_msg).as_ptr(),
+                    WS_CHILD | WS_VISIBLE,
+                    24, 372, 486, 18, hwnd, ID_ISD_STATIC_STATUS as _, 0 as _, null_mut(),
+                );
+                SendMessageW(h_status, WM_SETFONT, f as _, 1);
 
                 // Buttons
                 let b_submit = CreateWindowExW(
                     0, to_wide("BUTTON").as_ptr(), to_wide("Submit Issue (API)").as_ptr(),
                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                    24, 404, 160, 36, hwnd, ID_ISD_BTN_SUBMIT as _, 0 as _, null_mut(),
+                    24, 420, 160, 36, hwnd, ID_ISD_BTN_SUBMIT as _, 0 as _, null_mut(),
                 );
                 SendMessageW(b_submit, WM_SETFONT, fb as _, 1);
 
                 let b_web = CreateWindowExW(
                     0, to_wide("BUTTON").as_ptr(), to_wide("Open in GitHub Web").as_ptr(),
                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                    194, 404, 186, 36, hwnd, ID_ISD_BTN_WEB as _, 0 as _, null_mut(),
+                    194, 420, 186, 36, hwnd, ID_ISD_BTN_WEB as _, 0 as _, null_mut(),
                 );
                 SendMessageW(b_web, WM_SETFONT, fb as _, 1);
 
                 let b_close = CreateWindowExW(
                     0, to_wide("BUTTON").as_ptr(), to_wide("Close").as_ptr(),
                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                    400, 404, 110, 36, hwnd, ID_ISD_BTN_CLOSE as _, 0 as _, null_mut(),
+                    400, 420, 110, 36, hwnd, ID_ISD_BTN_CLOSE as _, 0 as _, null_mut(),
                 );
                 SendMessageW(b_close, WM_SETFONT, fb as _, 1);
 
@@ -2449,13 +2499,105 @@ unsafe extern "system" fn issue_dlg_proc(
                     let mut text_rc = RECT { left: x, top: y, right: x + 300, bottom: y + 18 };
                     DrawTextW(hdc, w.as_ptr(), (w.len() - 1) as _, &mut text_rc, DT_LEFT | DT_SINGLELINE);
                 }
+
+                // Draw Progress Bar
+                draw_progress_bar(hdc, 24, 396, 486, 10, ctx.progress_percent);
             }
 
             EndPaint(hwnd, &ps);
             0
         }
+        WM_TIMER => {
+            if wparam == ID_TIMER_ISSUE_PROGRESS {
+                if let Some(ref mut ctx) = ISSUE_CTX {
+                    if ctx.is_submitting && ctx.progress_percent < 88 {
+                        ctx.progress_percent += 3;
+                        ctx.status_msg = if ctx.progress_percent < 30 {
+                            "Authenticating with GitHub Credential Manager...".into()
+                        } else if ctx.progress_percent < 60 {
+                            "Connecting to api.github.com/repos/ssilkdev/putty-rs...".into()
+                        } else {
+                            "Uploading issue payload and tags...".into()
+                        };
+                        set_text(GetDlgItem(hwnd, ID_ISD_STATIC_STATUS as i32), &ctx.status_msg);
+                        let mut rc_bar = RECT { left: 24, top: 394, right: 514, bottom: 410 };
+                        InvalidateRect(hwnd, &rc_bar, 1);
+                    }
+                }
+            }
+            0
+        }
+        WM_USER..=0xFFFF if msg == WM_APP_ISSUE_DONE => {
+            KillTimer(hwnd, ID_TIMER_ISSUE_PROGRESS);
+            EnableWindow(GetDlgItem(hwnd, ID_ISD_BTN_SUBMIT as i32), 1);
+            EnableWindow(GetDlgItem(hwnd, ID_ISD_BTN_WEB as i32), 1);
+            EnableWindow(GetDlgItem(hwnd, ID_ISD_BTN_CLOSE as i32), 1);
+
+            let res = ISSUE_RESULT.take();
+            if let Some(res) = res {
+                match res {
+                    Ok(issue_url) => {
+                        if let Some(ref mut ctx) = ISSUE_CTX {
+                            ctx.progress_percent = 100;
+                            ctx.is_submitting = false;
+                            ctx.status_msg = "Completed! Issue successfully published.".into();
+                            set_text(GetDlgItem(hwnd, ID_ISD_STATIC_STATUS as i32), &ctx.status_msg);
+                        }
+                        let mut rc_bar = RECT { left: 24, top: 394, right: 514, bottom: 410 };
+                        InvalidateRect(hwnd, &rc_bar, 1);
+                        UpdateWindow(hwnd);
+
+                        let _ = copy_to_clipboard(hwnd, &issue_url);
+                        show_dark_alert(
+                            hwnd,
+                            "Issue Created",
+                            &format!("GitHub Issue created successfully!\r\n\r\nURL: {}\r\n(Copied to clipboard and opened in browser)", issue_url),
+                            PopupKind::Success,
+                        );
+                        open_browser_url(&issue_url);
+                        DestroyWindow(hwnd);
+                    }
+                    Err(err) => {
+                        if let Some(ref mut ctx) = ISSUE_CTX {
+                            ctx.progress_percent = 0;
+                            ctx.is_submitting = false;
+                            ctx.status_msg = "Submission failed.".into();
+                            set_text(GetDlgItem(hwnd, ID_ISD_STATIC_STATUS as i32), &ctx.status_msg);
+                        }
+                        let mut rc_bar = RECT { left: 24, top: 394, right: 514, bottom: 410 };
+                        InvalidateRect(hwnd, &rc_bar, 1);
+
+                        let should_open_web = show_dark_confirm(
+                            hwnd,
+                            "GitHub API Notice",
+                            &format!("Could not create Issue directly via API:\r\n{}\r\n\r\nWould you like to open GitHub Issue creation in your web browser instead?", err),
+                        );
+                        if should_open_web {
+                            open_browser_url("https://github.com/ssilkdev/putty-rs/issues/new");
+                            DestroyWindow(hwnd);
+                        }
+                    }
+                }
+            }
+            0
+        }
         WM_CTLCOLORSTATIC => {
             let hdc = wparam as HDC;
+            let hwnd_ctl = lparam as HWND;
+            if hwnd_ctl == GetDlgItem(hwnd, ID_ISD_STATIC_STATUS as i32) {
+                let is_done = ISSUE_CTX.as_ref().map(|c| c.progress_percent >= 100).unwrap_or(false);
+                let is_submitting = ISSUE_CTX.as_ref().map(|c| c.is_submitting).unwrap_or(false);
+                let col = if is_done {
+                    0x0032CD32 // Green
+                } else if is_submitting {
+                    0x00C3B700 // Cyan
+                } else {
+                    0x00888888 // Muted gray
+                };
+                SetTextColor(hdc, col);
+                SetBkColor(hdc, 0x00202020);
+                return if let Some(ref st) = APP_STATE { st.h_panel_brush as _ } else { GetStockObject(BLACK_BRUSH as _) as _ };
+            }
             SetTextColor(hdc, 0x00EDEDED);
             SetBkColor(hdc, 0x00202020);
             if let Some(ref st) = APP_STATE {
@@ -2527,30 +2669,33 @@ unsafe extern "system" fn issue_dlg_proc(
                         return 0;
                     }
 
-                    match submit_github_issue(&title, &body, label) {
-                        Ok(issue_url) => {
-                            let _ = copy_to_clipboard(hwnd, &issue_url);
-                            show_dark_alert(
-                                hwnd,
-                                "Issue Created",
-                                &format!("GitHub Issue created successfully!\r\n\r\nURL: {}\r\n(Copied to clipboard and opened in browser)", issue_url),
-                                PopupKind::Success,
-                            );
-                            open_browser_url(&issue_url);
-                            DestroyWindow(hwnd);
-                        }
-                        Err(err) => {
-                            let should_open_web = show_dark_confirm(
-                                hwnd,
-                                "GitHub API Notice",
-                                &format!("Could not create Issue directly via API:\r\n{}\r\n\r\nWould you like to open GitHub Issue creation in your web browser instead?", err),
-                            );
-                            if should_open_web {
-                                open_browser_url("https://github.com/ssilkdev/putty-rs/issues/new");
-                                DestroyWindow(hwnd);
-                            }
-                        }
+                    if let Some(ref mut ctx) = ISSUE_CTX {
+                        ctx.is_submitting = true;
+                        ctx.progress_percent = 12;
+                        ctx.status_msg = "Authenticating with GitHub Credential Manager...".into();
+                        set_text(GetDlgItem(hwnd, ID_ISD_STATIC_STATUS as i32), &ctx.status_msg);
                     }
+
+                    EnableWindow(GetDlgItem(hwnd, ID_ISD_BTN_SUBMIT as i32), 0);
+                    EnableWindow(GetDlgItem(hwnd, ID_ISD_BTN_WEB as i32), 0);
+                    EnableWindow(GetDlgItem(hwnd, ID_ISD_BTN_CLOSE as i32), 0);
+
+                    let mut rc_bar = RECT { left: 24, top: 394, right: 514, bottom: 410 };
+                    InvalidateRect(hwnd, &rc_bar, 1);
+                    SetTimer(hwnd, ID_TIMER_ISSUE_PROGRESS, 45, None);
+
+                    let hwnd_u = hwnd as usize;
+                    let title_c = title.clone();
+                    let body_c = body.clone();
+                    let label_c = label.to_string();
+
+                    std::thread::spawn(move || {
+                        let res = submit_github_issue(&title_c, &body_c, &label_c);
+                        unsafe {
+                            ISSUE_RESULT = Some(res);
+                            PostMessageW(hwnd_u as HWND, WM_APP_ISSUE_DONE, 0, 0);
+                        }
+                    });
                 }
                 ID_ISD_BTN_WEB => {
                     open_browser_url("https://github.com/ssilkdev/putty-rs/issues/new");
@@ -2564,6 +2709,7 @@ unsafe extern "system" fn issue_dlg_proc(
             0
         }
         WM_CLOSE => {
+            KillTimer(hwnd, ID_TIMER_ISSUE_PROGRESS);
             DestroyWindow(hwnd);
             0
         }
@@ -2581,6 +2727,9 @@ fn show_issue_dialog(parent: HWND) {
 
         ISSUE_CTX = Some(IssueContext {
             issue_type: 1,
+            progress_percent: 0,
+            status_msg: "Ready to submit issue to GitHub.".into(),
+            is_submitting: false,
             h_font,
             h_title_font,
             h_btn_font,
@@ -2604,7 +2753,7 @@ fn show_issue_dialog(parent: HWND) {
         let mut parent_rc: RECT = std::mem::zeroed();
         GetWindowRect(parent, &mut parent_rc);
         let w = 550;
-        let h = 490;
+        let h = 515;
         let x = parent_rc.left + ((parent_rc.right - parent_rc.left) - w) / 2;
         let y = parent_rc.top + ((parent_rc.bottom - parent_rc.top) - h) / 2;
 
@@ -2622,8 +2771,11 @@ fn show_issue_dialog(parent: HWND) {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, 0 as _, 0, 0) > 0 {
             if msg.message == WM_KEYDOWN && msg.wParam == 27 {
-                DestroyWindow(dlg);
-                break;
+                let is_sub = ISSUE_CTX.as_ref().map(|c| c.is_submitting).unwrap_or(false);
+                if !is_sub {
+                    DestroyWindow(dlg);
+                    break;
+                }
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -2636,10 +2788,14 @@ fn show_issue_dialog(parent: HWND) {
     }
 }
 
+
 static mut PR_CTX: Option<PrContext> = None;
 
 struct PrContext {
     current_branch: String,
+    progress_percent: u32,
+    status_msg: String,
+    is_submitting: bool,
     h_font: HFONT,
     h_title_font: HFONT,
     h_btn_font: HFONT,
@@ -2652,6 +2808,7 @@ const ID_PRD_EDIT_BODY: usize = 1304;
 const ID_PRD_BTN_SUBMIT: usize = 1305;
 const ID_PRD_BTN_WEB: usize = 1306;
 const ID_PRD_BTN_CLOSE: usize = 1307;
+const ID_PRD_STATIC_STATUS: usize = 1308;
 
 unsafe extern "system" fn pr_dlg_proc(
     hwnd: HWND,
@@ -2697,29 +2854,37 @@ unsafe extern "system" fn pr_dlg_proc(
                 let h_body = CreateWindowExW(
                     0, to_wide("EDIT").as_ptr(), to_wide(initial_body).as_ptr(),
                     WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | WS_VSCROLL | WS_TABSTOP,
-                    24, 184, 486, 206, hwnd, ID_PRD_EDIT_BODY as _, 0 as _, null_mut(),
+                    24, 184, 486, 180, hwnd, ID_PRD_EDIT_BODY as _, 0 as _, null_mut(),
                 );
                 SendMessageW(h_body, WM_SETFONT, f as _, 1);
+
+                // Progress Status Text
+                let h_status = CreateWindowExW(
+                    0, to_wide("STATIC").as_ptr(), to_wide(&ctx.status_msg).as_ptr(),
+                    WS_CHILD | WS_VISIBLE,
+                    24, 372, 486, 18, hwnd, ID_PRD_STATIC_STATUS as _, 0 as _, null_mut(),
+                );
+                SendMessageW(h_status, WM_SETFONT, f as _, 1);
 
                 // Buttons
                 let b_submit = CreateWindowExW(
                     0, to_wide("BUTTON").as_ptr(), to_wide("Submit PR (API)").as_ptr(),
                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                    24, 404, 160, 36, hwnd, ID_PRD_BTN_SUBMIT as _, 0 as _, null_mut(),
+                    24, 420, 160, 36, hwnd, ID_PRD_BTN_SUBMIT as _, 0 as _, null_mut(),
                 );
                 SendMessageW(b_submit, WM_SETFONT, fb as _, 1);
 
                 let b_web = CreateWindowExW(
                     0, to_wide("BUTTON").as_ptr(), to_wide("Open in GitHub Web").as_ptr(),
                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                    194, 404, 186, 36, hwnd, ID_PRD_BTN_WEB as _, 0 as _, null_mut(),
+                    194, 420, 186, 36, hwnd, ID_PRD_BTN_WEB as _, 0 as _, null_mut(),
                 );
                 SendMessageW(b_web, WM_SETFONT, fb as _, 1);
 
                 let b_close = CreateWindowExW(
                     0, to_wide("BUTTON").as_ptr(), to_wide("Close").as_ptr(),
                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                    400, 404, 110, 36, hwnd, ID_PRD_BTN_CLOSE as _, 0 as _, null_mut(),
+                    400, 420, 110, 36, hwnd, ID_PRD_BTN_CLOSE as _, 0 as _, null_mut(),
                 );
                 SendMessageW(b_close, WM_SETFONT, fb as _, 1);
 
@@ -2763,10 +2928,119 @@ unsafe extern "system" fn pr_dlg_proc(
                     let mut text_rc = RECT { left: x, top: y, right: x + 300, bottom: y + 18 };
                     DrawTextW(hdc, w.as_ptr(), (w.len() - 1) as _, &mut text_rc, DT_LEFT | DT_SINGLELINE);
                 }
+
+                // Draw Progress Bar
+                draw_progress_bar(hdc, 24, 396, 486, 10, ctx.progress_percent);
             }
 
             EndPaint(hwnd, &ps);
             0
+        }
+        WM_TIMER => {
+            if wparam == ID_TIMER_PR_PROGRESS {
+                if let Some(ref mut ctx) = PR_CTX {
+                    if ctx.is_submitting && ctx.progress_percent < 88 {
+                        ctx.progress_percent += 3;
+                        ctx.status_msg = if ctx.progress_percent < 30 {
+                            "Authenticating with GitHub Credential Manager...".into()
+                        } else if ctx.progress_percent < 60 {
+                            "Connecting to api.github.com/repos/ssilkdev/putty-rs...".into()
+                        } else {
+                            "Submitting Pull Request payload...".into()
+                        };
+                        set_text(GetDlgItem(hwnd, ID_PRD_STATIC_STATUS as i32), &ctx.status_msg);
+                        let mut rc_bar = RECT { left: 24, top: 394, right: 514, bottom: 410 };
+                        InvalidateRect(hwnd, &rc_bar, 1);
+                    }
+                }
+            }
+            0
+        }
+        WM_USER..=0xFFFF if msg == WM_APP_PR_DONE => {
+            KillTimer(hwnd, ID_TIMER_PR_PROGRESS);
+            EnableWindow(GetDlgItem(hwnd, ID_PRD_BTN_SUBMIT as i32), 1);
+            EnableWindow(GetDlgItem(hwnd, ID_PRD_BTN_WEB as i32), 1);
+            EnableWindow(GetDlgItem(hwnd, ID_PRD_BTN_CLOSE as i32), 1);
+
+            let res = PR_RESULT.take();
+            if let Some(res) = res {
+                match res {
+                    Ok(pr_url) => {
+                        if let Some(ref mut ctx) = PR_CTX {
+                            ctx.progress_percent = 100;
+                            ctx.is_submitting = false;
+                            ctx.status_msg = "Completed! Pull Request opened successfully.".into();
+                            set_text(GetDlgItem(hwnd, ID_PRD_STATIC_STATUS as i32), &ctx.status_msg);
+                        }
+                        let mut rc_bar = RECT { left: 24, top: 394, right: 514, bottom: 410 };
+                        InvalidateRect(hwnd, &rc_bar, 1);
+                        UpdateWindow(hwnd);
+
+                        let _ = copy_to_clipboard(hwnd, &pr_url);
+                        show_dark_alert(
+                            hwnd,
+                            "Pull Request Created",
+                            &format!("Pull Request created successfully on GitHub!\r\n\r\nURL: {}\r\n(Copied to clipboard and opened in browser)", pr_url),
+                            PopupKind::Success,
+                        );
+                        open_browser_url(&pr_url);
+                        DestroyWindow(hwnd);
+                    }
+                    Err(err) => {
+                        if let Some(ref mut ctx) = PR_CTX {
+                            ctx.progress_percent = 0;
+                            ctx.is_submitting = false;
+                            ctx.status_msg = "Submission failed.".into();
+                            set_text(GetDlgItem(hwnd, ID_PRD_STATIC_STATUS as i32), &ctx.status_msg);
+                        }
+                        let mut rc_bar = RECT { left: 24, top: 394, right: 514, bottom: 410 };
+                        InvalidateRect(hwnd, &rc_bar, 1);
+
+                        let should_open_web = show_dark_confirm(
+                            hwnd,
+                            "GitHub API Notice",
+                            &format!("Could not create PR directly via API:\r\n{}\r\n\r\nWould you like to open the GitHub Compare & PR page in your web browser instead?", err),
+                        );
+                        if should_open_web {
+                            let base = get_text(GetDlgItem(hwnd, ID_PRD_EDIT_BASE as i32)).trim().to_string();
+                            let head = get_text(GetDlgItem(hwnd, ID_PRD_EDIT_HEAD as i32)).trim().to_string();
+                            let web_url = if head != base && !head.is_empty() {
+                                format!("https://github.com/ssilkdev/putty-rs/compare/{}...{}?expand=1", base, head)
+                            } else {
+                                "https://github.com/ssilkdev/putty-rs/compare".to_string()
+                            };
+                            open_browser_url(&web_url);
+                            DestroyWindow(hwnd);
+                        }
+                    }
+                }
+            }
+            0
+        }
+        WM_CTLCOLORSTATIC => {
+            let hdc = wparam as HDC;
+            let hwnd_ctl = lparam as HWND;
+            if hwnd_ctl == GetDlgItem(hwnd, ID_PRD_STATIC_STATUS as i32) {
+                let is_done = PR_CTX.as_ref().map(|c| c.progress_percent >= 100).unwrap_or(false);
+                let is_submitting = PR_CTX.as_ref().map(|c| c.is_submitting).unwrap_or(false);
+                let col = if is_done {
+                    0x0032CD32
+                } else if is_submitting {
+                    0x00C3B700
+                } else {
+                    0x00888888
+                };
+                SetTextColor(hdc, col);
+                SetBkColor(hdc, 0x00202020);
+                return if let Some(ref st) = APP_STATE { st.h_panel_brush as _ } else { GetStockObject(BLACK_BRUSH as _) as _ };
+            }
+            SetTextColor(hdc, 0x00EDEDED);
+            SetBkColor(hdc, 0x00202020);
+            if let Some(ref st) = APP_STATE {
+                st.h_panel_brush as _
+            } else {
+                GetStockObject(BLACK_BRUSH as _) as _
+            }
         }
         WM_CTLCOLOREDIT => {
             let hdc = wparam as HDC;
@@ -2803,35 +3077,47 @@ unsafe extern "system" fn pr_dlg_proc(
                         return 0;
                     }
 
-                    match submit_github_pr(&base, &head, &title, &body) {
-                        Ok(pr_url) => {
-                            let _ = copy_to_clipboard(hwnd, &pr_url);
-                            show_dark_alert(
-                                hwnd,
-                                "Pull Request Created",
-                                &format!("Pull Request created successfully on GitHub!\r\n\r\nURL: {}\r\n(Copied to clipboard and opened in browser)", pr_url),
-                                PopupKind::Success,
-                            );
-                            open_browser_url(&pr_url);
+                    if head == base {
+                        let should_open = show_dark_confirm(
+                            hwnd,
+                            "Feature Branch Required",
+                            "GitHub requires that the head branch be different from 'main' to open a Pull Request.\r\nYou are currently on branch 'main'.\r\n\r\nWould you like to open the GitHub Compare page in your browser instead?",
+                        );
+                        if should_open {
+                            open_browser_url("https://github.com/ssilkdev/putty-rs/compare");
                             DestroyWindow(hwnd);
                         }
-                        Err(err) => {
-                            let should_open_web = show_dark_confirm(
-                                hwnd,
-                                "GitHub API Notice",
-                                &format!("Could not create PR directly via API:\r\n{}\r\n\r\nWould you like to open the GitHub Compare & PR page in your web browser instead?", err),
-                            );
-                            if should_open_web {
-                                let web_url = if head != base && !head.is_empty() {
-                                    format!("https://github.com/ssilkdev/putty-rs/compare/{}...{}?expand=1", base, head)
-                                } else {
-                                    "https://github.com/ssilkdev/putty-rs/compare".to_string()
-                                };
-                                open_browser_url(&web_url);
-                                DestroyWindow(hwnd);
-                            }
-                        }
+                        return 0;
                     }
+
+                    if let Some(ref mut ctx) = PR_CTX {
+                        ctx.is_submitting = true;
+                        ctx.progress_percent = 12;
+                        ctx.status_msg = "Authenticating with GitHub Credential Manager...".into();
+                        set_text(GetDlgItem(hwnd, ID_PRD_STATIC_STATUS as i32), &ctx.status_msg);
+                    }
+
+                    EnableWindow(GetDlgItem(hwnd, ID_PRD_BTN_SUBMIT as i32), 0);
+                    EnableWindow(GetDlgItem(hwnd, ID_PRD_BTN_WEB as i32), 0);
+                    EnableWindow(GetDlgItem(hwnd, ID_PRD_BTN_CLOSE as i32), 0);
+
+                    let mut rc_bar = RECT { left: 24, top: 394, right: 514, bottom: 410 };
+                    InvalidateRect(hwnd, &rc_bar, 1);
+                    SetTimer(hwnd, ID_TIMER_PR_PROGRESS, 45, None);
+
+                    let hwnd_u = hwnd as usize;
+                    let base_c = base.clone();
+                    let head_c = head.clone();
+                    let title_c = title.clone();
+                    let body_c = body.clone();
+
+                    std::thread::spawn(move || {
+                        let res = submit_github_pr(&base_c, &head_c, &title_c, &body_c);
+                        unsafe {
+                            PR_RESULT = Some(res);
+                            PostMessageW(hwnd_u as HWND, WM_APP_PR_DONE, 0, 0);
+                        }
+                    });
                 }
                 ID_PRD_BTN_WEB => {
                     let base = get_text(GetDlgItem(hwnd, ID_PRD_EDIT_BASE as i32)).trim().to_string();
@@ -2852,6 +3138,7 @@ unsafe extern "system" fn pr_dlg_proc(
             0
         }
         WM_CLOSE => {
+            KillTimer(hwnd, ID_TIMER_PR_PROGRESS);
             DestroyWindow(hwnd);
             0
         }
@@ -2871,6 +3158,9 @@ fn show_pr_dialog(parent: HWND) {
 
         PR_CTX = Some(PrContext {
             current_branch,
+            progress_percent: 0,
+            status_msg: "Ready to submit Pull Request to GitHub.".into(),
+            is_submitting: false,
             h_font,
             h_title_font,
             h_btn_font,
@@ -2894,7 +3184,7 @@ fn show_pr_dialog(parent: HWND) {
         let mut parent_rc: RECT = std::mem::zeroed();
         GetWindowRect(parent, &mut parent_rc);
         let w = 550;
-        let h = 490;
+        let h = 515;
         let x = parent_rc.left + ((parent_rc.right - parent_rc.left) - w) / 2;
         let y = parent_rc.top + ((parent_rc.bottom - parent_rc.top) - h) / 2;
 
@@ -2912,8 +3202,11 @@ fn show_pr_dialog(parent: HWND) {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, 0 as _, 0, 0) > 0 {
             if msg.message == WM_KEYDOWN && msg.wParam == 27 {
-                DestroyWindow(dlg);
-                break;
+                let is_sub = PR_CTX.as_ref().map(|c| c.is_submitting).unwrap_or(false);
+                if !is_sub {
+                    DestroyWindow(dlg);
+                    break;
+                }
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -2925,6 +3218,7 @@ fn show_pr_dialog(parent: HWND) {
         SetFocus(parent);
     }
 }
+
 
 // Main Window Procedure & Initialization
 // -------------------------------------------------------------

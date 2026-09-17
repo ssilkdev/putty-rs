@@ -1,0 +1,8 @@
+﻿/target
+**/*.rs.bk
+*.pdb
+.env
+.DS_Store
+Thumbs.db
+*.exe
+!crates/**

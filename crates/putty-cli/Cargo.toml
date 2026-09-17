@@ -1,0 +1,28 @@
+[package]
+name = "putty-cli"
+version = "0.85.0"
+edition = "2021"
+authors = ["PuTTY Rust Team"]
+description = "CLI executables for PuTTY in Rust: plink-rs, puttygen-rs, putty-rs"
+
+[dependencies]
+putty-fips = { path = "../putty-fips" }
+putty-crypto = { path = "../putty-crypto" }
+putty-config = { path = "../putty-config" }
+putty-term = { path = "../putty-term" }
+putty-protocol = { path = "../putty-protocol" }
+thiserror = "1.0"
+crossterm = "0.28"
+rpassword = "7.3"
+
+[[bin]]
+name = "plink-rs"
+path = "src/bin/plink.rs"
+
+[[bin]]
+name = "puttygen-rs"
+path = "src/bin/puttygen.rs"
+
+[[bin]]
+name = "putty-rs"
+path = "src/bin/putty.rs"

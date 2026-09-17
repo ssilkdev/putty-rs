@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/putty-fips",
+    "crates/putty-crypto",
+    "crates/putty-config",
+    "crates/putty-term",
+    "crates/putty-protocol",
+    "crates/putty-cli",
+    "crates/putty-gui",
+]
+resolver = "2"

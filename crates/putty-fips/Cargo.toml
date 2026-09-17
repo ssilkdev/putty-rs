@@ -1,0 +1,16 @@
+[package]
+name = "putty-fips"
+version = "0.85.0"
+edition = "2021"
+authors = ["PuTTY Rust Team"]
+description = "FIPS 140-3 policy engine, algorithm filtering, and Known Answer Tests (KAT) for PuTTY"
+
+[dependencies]
+thiserror = "1.0"
+zeroize = { version = "1.8", features = ["derive"] }
+aes = "0.8"
+ctr = "0.9"
+aes-gcm = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2.6"

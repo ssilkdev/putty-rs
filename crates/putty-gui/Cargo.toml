@@ -1,0 +1,26 @@
+[package]
+name = "putty-gui"
+version = "0.85.0"
+edition = "2021"
+authors = ["PuTTY Rust Team"]
+description = "Modern sleek native Windows GUI for PuTTY in Rust with FIPS 140-3 mode"
+
+[dependencies]
+putty-fips = { path = "../putty-fips" }
+putty-crypto = { path = "../putty-crypto" }
+putty-config = { path = "../putty-config" }
+putty-term = { path = "../putty-term" }
+putty-protocol = { path = "../putty-protocol" }
+thiserror = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+] }

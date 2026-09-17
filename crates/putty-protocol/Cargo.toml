@@ -1,0 +1,15 @@
+[package]
+name = "putty-protocol"
+version = "0.85.0"
+edition = "2021"
+authors = ["PuTTY Rust Team"]
+description = "Network protocols: SSH-2, Telnet, and Raw TCP with FIPS 140-3 protocol gating"
+
+[dependencies]
+putty-fips = { path = "../putty-fips" }
+putty-crypto = { path = "../putty-crypto" }
+putty-config = { path = "../putty-config" }
+byteorder = "1.5"
+thiserror = "1.0"
+rand = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }

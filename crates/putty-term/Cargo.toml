@@ -1,0 +1,13 @@
+[package]
+name = "putty-term"
+version = "0.85.0"
+edition = "2021"
+authors = ["PuTTY Rust Team"]
+description = "Terminal emulation, escape sequence handling, and Windows Console / ConPTY Seat"
+
+[dependencies]
+crossterm = "0.28"
+thiserror = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }
